@@ -95,10 +95,28 @@ CREATE TABLE IF NOT EXISTS items (
 games_db.commit()
 nongames_db.commit()
 
+# === СОСТОЯНИЕ ПАРСИНГА ===
+
+games_cur.execute("""
+CREATE TABLE IF NOT EXISTS parser_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_appid INTEGER
+)
+""")
+
+# гарантируем одну строку
+games_cur.execute("""
+INSERT OR IGNORE INTO parser_state (id, last_appid)
+VALUES (1, 0)
+""")
+
+games_db.commit()
+
 # ================== STEAM ==================
 
 def get_appdetails(appid):
-    print(f"[{appid}] Парсим Steam API...")
+    print(f"[{appid}]")
+    print("Парсим Steam API...")
     url = "https://store.steampowered.com/api/appdetails"
     params = {
         "appids": appid,
@@ -117,7 +135,7 @@ def get_price_usd(data):
     return price.get("final", 0) / 100
 
 def get_tags(appid):
-    print(f"[{appid}] Парсим теги...")
+    print("Парсим теги...")
     url = f"https://store.steampowered.com/app/{appid}?l=russian"
     r = requests.get(url, headers=HEADERS, cookies=AGE_COOKIES, timeout=10)
     if r.status_code != 200:
@@ -126,7 +144,7 @@ def get_tags(appid):
     return [t.get_text(strip=True) for t in soup.select("a.app_tag")]
 
 def get_reviews_summary(appid):
-    print(f"[{appid}] Парсим отзывы Steam...")
+    print("Парсим отзывы Steam...")
     url = f"https://store.steampowered.com/appreviews/{appid}"
     params = {
         "json": 1,
@@ -149,7 +167,7 @@ def get_reviews_summary(appid):
 
 def get_hltb(game_name):
     start_hltb = time.time()
-    print(f"[{game_name}] Парсим HLTB...")
+    print(f" Парсим HLTB...")
     try:
         results = hltb.search(game_name)
         if not results:
@@ -158,7 +176,8 @@ def get_hltb(game_name):
         end_hltb = time.time()
         print(end_hltb - start_hltb)
         return r.main_story, r.main_extra, r.completionist, r.game_id
-    except:
+
+    except Exception:
         end_hltb = time.time()
         print(end_hltb - start_hltb)
         return None, None, None, None
@@ -172,6 +191,7 @@ def process_app(appid):
     data = app.get("data", {})
     item_type = data.get("type")
     name = data.get("name")
+    print(f"[{name}]")
 
     if not app.get("success"):
         nongames_cur.execute(
@@ -192,7 +212,6 @@ def process_app(appid):
 
     price = get_price_usd(data)
     tags = get_tags(appid)
-    # Теги
     games_cur.execute('DELETE FROM game_tags WHERE steam_appid=?', (appid,))
     for tag in tags:
         games_cur.execute('INSERT INTO game_tags (steam_appid, tag) VALUES (?,?)',
@@ -247,10 +266,22 @@ def process_app(appid):
 
 
     games_db.commit()
+    set_last_processed_appid(appid)
 
     elapsed = time.time() - start
     if elapsed < MIN_APP_TIME:
         time.sleep(MIN_APP_TIME - elapsed)
+
+def get_last_processed_appid():
+    games_cur.execute("SELECT last_appid FROM parser_state WHERE id=1")
+    return games_cur.fetchone()[0]
+
+def set_last_processed_appid(appid):
+    games_cur.execute(
+        "UPDATE parser_state SET last_appid=? WHERE id=1",
+        (appid,)
+    )
+    games_db.commit()
 
 # ================== ЗАПУСК ==================
 
@@ -271,33 +302,39 @@ if __name__ == "__main__":
     FILE = "steam_appids.json"
     with open(FILE, 'r', encoding='utf-8') as f:
         appids = json.load(f)
-    appids = [22490, 343300]
+
+    # appids = [22490, 343300]
     # appids = fetch_test_appids()
+    last_appid = get_last_processed_appid()
+
+    if last_appid:
+        print(f"Продолжаем с appid > {last_appid}")
+        appids = [a for a in appids if a > last_appid]
+
     total = len(appids)
 
     start_all = time.time()
 
-    for idx, appid in enumerate(appids, 1):
-        app_start = time.time()
-
-        try:
-            print(f"\n=== Обработка {idx}/{total} AppID ({idx/total*100:.1f}%) ===")
-            process_app(appid)
-            status = "Готово"
-        except Exception as e:
-            status = f"Ошибка: {e}"
-
-        elapsed = time.time() - app_start
-        processed_times.append(elapsed)
-
-        avg_time = sum(processed_times) / len(processed_times)
-        remaining = total - idx
-        eta_seconds = avg_time * remaining
-
-        print(f"[{appid}] {status}")
-        print(
-            f"Время: {elapsed:.2f}s | "
-            f"Среднее: {avg_time:.2f}s | "
-            f"Осталось: {remaining} | "
-            f"ETA: {format_eta(eta_seconds)}"
-        )
+    try:
+        for idx, appid in enumerate(appids, 1):
+            app_start = time.time()
+            try:
+                print(f"\n=== Обработка {idx}/{total} AppID ({idx/total*100:.1f}%) ===")
+                process_app(appid)
+                status = "Готово"
+            except Exception as e:
+                status = f"Ошибка: {e}"
+            elapsed = time.time() - app_start
+            processed_times.append(elapsed)
+            avg_time = sum(processed_times) / len(processed_times)
+            remaining = total - idx
+            eta_seconds = avg_time * remaining
+            print(f"[{appid}] {status}")
+            print(
+                f"Время: {elapsed:.2f}s | "
+                f"Среднее: {avg_time:.2f}s | "
+                f"Осталось: {remaining} | "
+                f"ETA: {format_eta(eta_seconds)}"
+            )
+    except KeyboardInterrupt:
+        print("Прервано пользователем")
