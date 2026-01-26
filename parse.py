@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 import requests
 import sqlite3
@@ -11,6 +12,14 @@ from howlongtobeatpy import HowLongToBeat
 with open('steam_api.json', 'r', encoding='utf-8') as f:
     STEAM_API_KEY = json.load(f)
 MIN_APP_TIME = 3.0
+MAX_RETRIES = 3
+SKIPPED_FILE = "skipped_appids.json"
+if os.path.exists(SKIPPED_FILE):
+    with open(SKIPPED_FILE, "r", encoding="utf-8") as f:
+        skipped_appids = set(json.load(f))
+else:
+    skipped_appids = set()
+
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -72,7 +81,6 @@ CREATE TABLE IF NOT EXISTS game_genres (
 )
 """)
 
-# Нормализованная таблица тегов
 games_cur.execute("""
 CREATE TABLE IF NOT EXISTS game_tags (
     steam_appid INTEGER,
@@ -167,7 +175,7 @@ def get_reviews_summary(appid):
 
 def get_hltb(game_name):
     start_hltb = time.time()
-    print(f" Парсим HLTB...")
+    print(f"Парсим HLTB...")
     try:
         results = hltb.search(game_name)
         if not results:
@@ -176,6 +184,9 @@ def get_hltb(game_name):
         end_hltb = time.time()
         print(end_hltb - start_hltb)
         return r.main_story, r.main_extra, r.completionist, r.game_id
+
+    except KeyboardInterrupt:
+        raise
 
     except Exception:
         end_hltb = time.time()
@@ -187,7 +198,14 @@ def get_hltb(game_name):
 
 def process_app(appid):
     start = time.time()
-    app = get_appdetails(appid)
+
+    app = retry_call(
+        get_appdetails,
+        appid,
+        appid=appid,
+        label="Steam appdetails"
+    )
+
     data = app.get("data", {})
     item_type = data.get("type")
     name = data.get("name")
@@ -211,18 +229,29 @@ def process_app(appid):
         return
 
     price = get_price_usd(data)
-    tags = get_tags(appid)
+    tags = retry_call(
+        get_tags,
+        appid,
+        appid=appid,
+        label="Steam tags"
+    )
+
     games_cur.execute('DELETE FROM game_tags WHERE steam_appid=?', (appid,))
     for tag in tags:
         games_cur.execute('INSERT INTO game_tags (steam_appid, tag) VALUES (?,?)',
                           (appid, tag))
 
-    total_reviews, positive_reviews, negative_reviews, review_score = get_reviews_summary(appid)
+    total_reviews, positive_reviews, negative_reviews, review_score = retry_call(
+        get_reviews_summary,
+        appid,
+        appid=appid,
+        label="Steam reviews"
+    )
+
     hltb_main, hltb_extra, hltb_completion, hltb_id = get_hltb(name)
 
     supported_languages = data.get("supported_languages")
 
-    # Сохраняем основное
     games_cur.execute("""
     INSERT OR REPLACE INTO games
     (appid, name, price_usd, short_description, header_image, developers, publishers, release_date,
@@ -282,6 +311,26 @@ def set_last_processed_appid(appid):
         (appid,)
     )
     games_db.commit()
+
+def retry_call(func, *args, retries=MAX_RETRIES, delay=2, appid=None, label=""):
+    for attempt in range(1, retries + 1):
+        try:
+            return func(*args)
+
+        except KeyboardInterrupt:
+            raise
+
+        except Exception as e:
+            print(f"[!] {label} ошибка (попытка {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                if appid is not None:
+                    skipped_appids.add(appid)
+                    with open(SKIPPED_FILE, "w", encoding="utf-8") as f:
+                        json.dump(sorted(skipped_appids), f, ensure_ascii=False, indent=2)
+                raise
+
 
 # ================== ЗАПУСК ==================
 
