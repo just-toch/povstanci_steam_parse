@@ -65,32 +65,43 @@ CREATE TABLE IF NOT EXISTS games (
 
 games_cur.execute("""
 CREATE TABLE IF NOT EXISTS game_categories (
-    steam_appid INTEGER,
+    appid INTEGER,
     category TEXT,
-    PRIMARY KEY (steam_appid, category),
-    FOREIGN KEY (steam_appid) REFERENCES games(appid)
+    PRIMARY KEY (appid, category),
+    FOREIGN KEY (appid) REFERENCES games(appid)
 )
 """)
 
 games_cur.execute("""
 CREATE TABLE IF NOT EXISTS game_genres (
-    steam_appid INTEGER,
+    appid INTEGER,
     genre TEXT,
-    PRIMARY KEY (steam_appid, genre),
-    FOREIGN KEY (steam_appid) REFERENCES games(appid)
+    PRIMARY KEY (appid, genre),
+    FOREIGN KEY (appid) REFERENCES games(appid)
 )
 """)
 
 games_cur.execute("""
 CREATE TABLE IF NOT EXISTS game_tags (
-    steam_appid INTEGER,
+    appid INTEGER,
     tag TEXT,
-    PRIMARY KEY (steam_appid, tag),
-    FOREIGN KEY (steam_appid) REFERENCES games(appid)
+    PRIMARY KEY (appid, tag),
+    FOREIGN KEY (appid) REFERENCES games(appid)
 )
 """)
 
-# Таблица для не-игр
+games_cur.execute("""
+CREATE TABLE IF NOT EXISTS parser_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    last_appid INTEGER
+)
+""")
+
+games_cur.execute("""
+INSERT OR IGNORE INTO parser_state (id, last_appid)
+VALUES (1, 0)
+""")
+
 nongames_cur.execute("""
 CREATE TABLE IF NOT EXISTS items (
     appid INTEGER PRIMARY KEY,
@@ -102,23 +113,6 @@ CREATE TABLE IF NOT EXISTS items (
 
 games_db.commit()
 nongames_db.commit()
-
-# === СОСТОЯНИЕ ПАРСИНГА ===
-
-games_cur.execute("""
-CREATE TABLE IF NOT EXISTS parser_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    last_appid INTEGER
-)
-""")
-
-# гарантируем одну строку
-games_cur.execute("""
-INSERT OR IGNORE INTO parser_state (id, last_appid)
-VALUES (1, 0)
-""")
-
-games_db.commit()
 
 # ================== STEAM ==================
 
@@ -236,9 +230,9 @@ def process_app(appid):
         label="Steam tags"
     )
 
-    games_cur.execute('DELETE FROM game_tags WHERE steam_appid=?', (appid,))
+    games_cur.execute('DELETE FROM game_tags WHERE appid=?', (appid,))
     for tag in tags:
-        games_cur.execute('INSERT INTO game_tags (steam_appid, tag) VALUES (?,?)',
+        games_cur.execute('INSERT INTO game_tags (appid, tag) VALUES (?,?)',
                           (appid, tag))
 
     total_reviews, positive_reviews, negative_reviews, review_score = retry_call(
@@ -281,15 +275,15 @@ def process_app(appid):
     ))
 
     # Категории
-    games_cur.execute('DELETE FROM game_categories WHERE steam_appid=?', (appid,))
+    games_cur.execute('DELETE FROM game_categories WHERE appid=?', (appid,))
     for cat in data.get("categories", []):
-        games_cur.execute('INSERT INTO game_categories (steam_appid, category) VALUES (?,?)',
+        games_cur.execute('INSERT INTO game_categories (appid, category) VALUES (?,?)',
                           (appid, cat.get("description")))
 
     # Жанры
-    games_cur.execute('DELETE FROM game_genres WHERE steam_appid=?', (appid,))
+    games_cur.execute('DELETE FROM game_genres WHERE appid=?', (appid,))
     for genre in data.get("genres", []):
-        games_cur.execute('INSERT INTO game_genres (steam_appid, genre) VALUES (?,?)',
+        games_cur.execute('INSERT INTO game_genres (appid, genre) VALUES (?,?)',
                           (appid, genre.get("description")))
 
 
@@ -334,8 +328,9 @@ def retry_call(func, *args, retries=MAX_RETRIES, delay=2, appid=None, label=""):
 
 # ================== ЗАПУСК ==================
 
-def fetch_test_appids(n=5):
+def random_test_appids(n=5):
     test_ids = appids
+    random.shuffle(test_ids)
     return test_ids[:n]
 
 
@@ -351,9 +346,9 @@ if __name__ == "__main__":
     FILE = "steam_appids.json"
     with open(FILE, 'r', encoding='utf-8') as f:
         appids = json.load(f)
-
+    appids = sorted(set(appids))
     # appids = [22490, 343300]
-    # appids = fetch_test_appids()
+    # appids = random_test_appids(10)
     last_appid = get_last_processed_appid()
 
     if last_appid:
