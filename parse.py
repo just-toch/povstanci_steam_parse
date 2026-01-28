@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import timedelta
 import requests
 import sqlite3
@@ -32,6 +33,20 @@ AGE_COOKIES = {
 }
 
 hltb = HowLongToBeat()
+RU_MONTHS = {
+    "янв": "01",
+    "фев": "02",
+    "мар": "03",
+    "апр": "04",
+    "май": "05",
+    "июн": "06",
+    "июл": "07",
+    "авг": "08",
+    "сен": "09",
+    "окт": "10",
+    "ноя": "11",
+    "дек": "12"
+}
 
 # ================== БАЗЫ ==================
 
@@ -167,11 +182,14 @@ def get_reviews_summary(appid):
 
 # ================== HLTB ==================
 
+
+
 def get_hltb(game_name):
     start_hltb = time.time()
     print(f"Парсим HLTB...")
     try:
-        results = hltb.search(game_name)
+        clean_name = re.sub(r'[^A-Za-zА-Яа-я0-9 ]+', '', game_name).strip()
+        results = hltb.search(clean_name)
         if not results:
             return None, None, None, None
         r = results[0]
@@ -230,7 +248,6 @@ def process_app(appid):
         label="Steam tags"
     )
 
-    games_cur.execute('DELETE FROM game_tags WHERE appid=?', (appid,))
     for tag in tags:
         games_cur.execute('INSERT INTO game_tags (appid, tag) VALUES (?,?)',
                           (appid, tag))
@@ -242,7 +259,12 @@ def process_app(appid):
         label="Steam reviews"
     )
 
-    hltb_main, hltb_extra, hltb_completion, hltb_id = get_hltb(name)
+    if data.get("release_date", {}).get('coming_soon'):
+        release_date = data.get("release_date", {}).get("date")
+        hltb_main, hltb_extra, hltb_completion, hltb_id = None, None, None, None
+    else:
+        release_date = convert_release_date(data.get("release_date", {}).get("date"))
+        hltb_main, hltb_extra, hltb_completion, hltb_id = get_hltb(name)
 
     supported_languages = data.get("supported_languages")
 
@@ -261,7 +283,7 @@ def process_app(appid):
         data.get("header_image"),
         ", ".join(data.get("developers", [])),
         ", ".join(data.get("publishers", [])),
-        data.get("release_date", {}).get("date"),
+        release_date,
         supported_languages,
         total_reviews,
         positive_reviews,
@@ -275,18 +297,28 @@ def process_app(appid):
     ))
 
     # Категории
-    games_cur.execute('DELETE FROM game_categories WHERE appid=?', (appid,))
-    for cat in data.get("categories", []):
-        games_cur.execute('INSERT INTO game_categories (appid, category) VALUES (?,?)',
-                          (appid, cat.get("description")))
+    categories = {
+        c["description"].strip()
+        for c in data.get("categories", [])
+        if c.get("description")
+    }
+
+    games_cur.executemany(
+        'INSERT OR IGNORE INTO game_categories (appid, category) VALUES (?, ?)',
+        [(appid, cat) for cat in categories]
+    )
 
     # Жанры
-    games_cur.execute('DELETE FROM game_genres WHERE appid=?', (appid,))
-    for genre in data.get("genres", []):
-        games_cur.execute('INSERT INTO game_genres (appid, genre) VALUES (?,?)',
-                          (appid, genre.get("description")))
+    genres = {
+        g["description"].strip()
+        for g in data.get("genres", [])
+        if g.get("description")
+    }
 
-
+    games_cur.executemany(
+        'INSERT OR IGNORE INTO game_genres (appid, genre) VALUES (?, ?)',
+        [(appid, genre) for genre in genres]
+    )
 
     games_db.commit()
     set_last_processed_appid(appid)
@@ -339,6 +371,16 @@ def format_eta(seconds):
         return "0s"
     return str(timedelta(seconds=int(seconds)))
 
+
+def convert_release_date(date_str: str) -> str:
+    date_str = date_str.lower().strip()
+    date_str = re.sub(r'\s*г\.\s*$', '', date_str)
+    parts = date_str.split()
+    day, month_rus, year = parts
+    month = RU_MONTHS.get(month_rus[:3])
+    return f"{year}-{month}-{int(day):02d}"
+
+
 processed_times = []
 start_all = None
 
@@ -347,14 +389,15 @@ if __name__ == "__main__":
     with open(FILE, 'r', encoding='utf-8') as f:
         appids = json.load(f)
     appids = sorted(set(appids))
-    # appids = [22490, 343300]
-    # appids = random_test_appids(10)
+
     last_appid = get_last_processed_appid()
 
     if last_appid:
         print(f"Продолжаем с appid > {last_appid}")
         appids = [a for a in appids if a > last_appid]
 
+    # appids = [220, 550, 620, 730, 239030, 3910680]
+    # appids = random_test_appids(10)
     total = len(appids)
 
     start_all = time.time()
