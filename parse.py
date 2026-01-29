@@ -38,6 +38,7 @@ RU_MONTHS = {
     "фев": "02",
     "мар": "03",
     "апр": "04",
+    "мая": "05",
     "май": "05",
     "июн": "06",
     "июл": "07",
@@ -138,6 +139,19 @@ def get_appdetails(appid):
     params = {
         "appids": appid,
         "cc": "US",
+        "l": "en"
+    }
+    r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return data.get(str(appid), {})
+
+def get_appdetails_ru(appid):
+    print(f"[{appid}]")
+    url = "https://store.steampowered.com/api/appdetails"
+    params = {
+        "appids": appid,
+        "cc": "US",
         "l": "ru"
     }
     r = requests.get(url, params=params, headers=HEADERS, timeout=10)
@@ -188,7 +202,7 @@ def get_hltb(game_name):
     start_hltb = time.time()
     print(f"Парсим HLTB...")
     try:
-        clean_name = re.sub(r'[^A-Za-zА-Яа-я0-9 ]+', '', game_name).strip()
+        clean_name = re.sub(r'[^A-Za-zА-Яа-я0-9 ]+', ' ', game_name).lower().strip()
         results = hltb.search(clean_name)
         if not results:
             return None, None, None, None
@@ -217,8 +231,14 @@ def process_app(appid):
         appid=appid,
         label="Steam appdetails"
     )
-
+    app_ru = retry_call(
+        get_appdetails_ru,
+        appid,
+        appid=appid,
+        label="Steam appdetails"
+    )
     data = app.get("data", {})
+    data_ru = app_ru.get("data", {})
     item_type = data.get("type")
     name = data.get("name")
     print(f"[{name}]")
@@ -260,10 +280,10 @@ def process_app(appid):
     )
 
     if data.get("release_date", {}).get('coming_soon'):
-        release_date = data.get("release_date", {}).get("date")
+        release_date = 'Coming soon'
         hltb_main, hltb_extra, hltb_completion, hltb_id = None, None, None, None
     else:
-        release_date = convert_release_date(data.get("release_date", {}).get("date"))
+        release_date = convert_release_date(data_ru.get("release_date", {}).get("date"))
         hltb_main, hltb_extra, hltb_completion, hltb_id = get_hltb(name)
 
     supported_languages = data.get("supported_languages")
@@ -279,7 +299,7 @@ def process_app(appid):
         appid,
         name,
         price,
-        data.get("short_description"),
+        data_ru.get("short_description"),
         data.get("header_image"),
         ", ".join(data.get("developers", [])),
         ", ".join(data.get("publishers", [])),
@@ -396,8 +416,8 @@ if __name__ == "__main__":
         print(f"Продолжаем с appid > {last_appid}")
         appids = [a for a in appids if a > last_appid]
 
-    # appids = [220, 550, 620, 730, 239030, 3910680]
-    # appids = random_test_appids(10)
+    # appids = [1599660]
+    appids = random_test_appids(150)
     total = len(appids)
 
     start_all = time.time()
