@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import logging
 from collections import deque
 from datetime import timedelta
@@ -10,23 +11,59 @@ import json
 import random
 from bs4 import BeautifulSoup
 
-import hltb_client  # вместо howlongtobeatpy
+
+# ================== ПУТИ ==================
+
+def _base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _app_path(f: str) -> str:
+    return os.path.join(_base_dir(), f)
+
+def _internal_path(f: str) -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, f)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f)
+
+_internal = _internal_path("")
+if _internal not in sys.path:
+    sys.path.insert(0, _internal)
+
+import hltb_client
+
+
+# ================== СТОП-ФЛАГ ==================
+# Объявляем в самом начале — используется во всех функциях ниже
+
+_GUI_STOP_EVENT = None
+
+def _should_stop() -> bool:
+    return _GUI_STOP_EVENT is not None and _GUI_STOP_EVENT.is_set()
+
+class StopRequested(Exception):
+    pass
+
 
 # ================== ЛОГИРОВАНИЕ ==================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("parser.log", encoding="utf-8"),
+        logging.FileHandler(_app_path("parser.log"), encoding="utf-8"),
     ]
 )
 log = logging.getLogger(__name__)
 
+
 # ================== НАСТРОЙКИ ==================
+
 MIN_APP_TIME = 3.0
-MAX_RETRIES = 3
-SKIPPED_FILE = "skipped_appids.json"
+MAX_RETRIES  = 3
+SKIPPED_FILE = _app_path("skipped_appids.json")
 
 if os.path.exists(SKIPPED_FILE):
     with open(SKIPPED_FILE, "r", encoding="utf-8") as f:
@@ -54,9 +91,9 @@ RU_MONTHS = {
 # ================== БАЗА ДАННЫХ ==================
 
 def init_databases():
-    games_db = sqlite3.connect("games.db")
-    nongames_db = sqlite3.connect("nongames.db")
-    games_cur = games_db.cursor()
+    games_db     = sqlite3.connect(_app_path("games.db"))
+    nongames_db  = sqlite3.connect(_app_path("nongames.db"))
+    games_cur    = games_db.cursor()
     nongames_cur = nongames_db.cursor()
 
     games_cur.executescript("""
@@ -79,83 +116,78 @@ def init_databases():
             hltb_completion REAL,
             hltb_id INTEGER
         );
-
         CREATE TABLE IF NOT EXISTS tags_dict (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS tags_games (
-            appid INTEGER,
-            tag_id INTEGER,
+            appid INTEGER, tag_id INTEGER,
             PRIMARY KEY (appid, tag_id)
         );
-
         CREATE TABLE IF NOT EXISTS genres_dict (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS genres_games (
-            appid INTEGER,
-            genre_id INTEGER,
+            appid INTEGER, genre_id INTEGER,
             PRIMARY KEY (appid, genre_id)
         );
-
         CREATE TABLE IF NOT EXISTS categories_dict (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS categories_games (
-            appid INTEGER,
-            category_id INTEGER,
+            appid INTEGER, category_id INTEGER,
             PRIMARY KEY (appid, category_id)
         );
-
         CREATE TABLE IF NOT EXISTS developers_dict (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS developers_games (
-            appid INTEGER,
-            developer_id INTEGER,
+            appid INTEGER, developer_id INTEGER,
             PRIMARY KEY (appid, developer_id)
         );
-
         CREATE TABLE IF NOT EXISTS publishers_dict (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS publishers_games (
-            appid INTEGER,
-            publisher_id INTEGER,
+            appid INTEGER, publisher_id INTEGER,
             PRIMARY KEY (appid, publisher_id)
         );
-
         CREATE TABLE IF NOT EXISTS languages_dict (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE
         );
         CREATE TABLE IF NOT EXISTS languages_games (
-            appid INTEGER,
-            language_id INTEGER,
-            full_audio INTEGER,
+            appid INTEGER, language_id INTEGER, full_audio INTEGER,
             PRIMARY KEY (appid, language_id)
         );
-
         CREATE TABLE IF NOT EXISTS parser_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
-            last_appid INTEGER
+            last_appid INTEGER,
+            current_appid INTEGER
         );
-        INSERT OR IGNORE INTO parser_state (id, last_appid) VALUES (1, 0);
+        INSERT OR IGNORE INTO parser_state (id, last_appid, current_appid)
+        VALUES (1, 0, NULL);
     """)
 
     nongames_cur.execute("""
         CREATE TABLE IF NOT EXISTS items (
             appid INTEGER PRIMARY KEY,
-            name TEXT,
-            type TEXT,
-            appdetails_json TEXT
+            name TEXT, type TEXT, appdetails_json TEXT
         )
     """)
+
+    # Миграция старой БД
+    try:
+        games_cur.execute(
+            "ALTER TABLE parser_state ADD COLUMN current_appid INTEGER")
+        games_db.commit()
+        log.info("Миграция БД: добавлена колонка current_appid")
+    except Exception:
+        pass  # колонка уже есть
 
     games_db.commit()
     nongames_db.commit()
@@ -190,14 +222,16 @@ def get_tags(appid):
     )
     if r.status_code != 200:
         return []
-    return [t.get_text(strip=True) for t in BeautifulSoup(r.text, "html.parser").select("a.app_tag")]
+    return [t.get_text(strip=True)
+            for t in BeautifulSoup(r.text, "html.parser").select("a.app_tag")]
 
 
 def get_reviews_summary(appid):
     log.info(f"[{appid}] Отзывы...")
     r = requests.get(
         f"https://store.steampowered.com/appreviews/{appid}",
-        params={"json": 1, "language": "all", "purchase_type": "all", "filter": "all"},
+        params={"json": 1, "language": "all",
+                "purchase_type": "all", "filter": "all"},
         headers=HEADERS, timeout=10
     )
     r.raise_for_status()
@@ -213,10 +247,8 @@ def get_reviews_summary(appid):
 # ================== HLTB ==================
 
 def get_hltb(game_name: str):
-    """
-    Ищет игру на HowLongToBeat через hltb_client (без howlongtobeatpy).
-    Возвращает (main, extra, completionist, game_id) или (None, None, None, None).
-    """
+    if _should_stop():
+        raise StopRequested()
     log.info(f"HLTB: поиск «{game_name}»...")
     t = time.time()
     try:
@@ -233,6 +265,8 @@ def get_hltb(game_name: str):
             f"100%={r['completionist']}h ({elapsed:.2f}s)"
         )
         return r["main_story"], r["main_extra"], r["completionist"], r["game_id"]
+    except StopRequested:
+        raise
     except KeyboardInterrupt:
         raise
     except Exception as e:
@@ -267,7 +301,8 @@ def parse_supported_languages(raw: str) -> dict:
     if not raw:
         return {}
     raw = re.sub(r"<.*?>", "", raw)
-    raw = re.sub(r"\*?\s*languages with full audio support.*$", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\*?\s*languages with full audio support.*$", "", raw,
+                 flags=re.IGNORECASE)
     languages = {}
     for part in [p.strip() for p in raw.split(",") if p.strip()]:
         if part.endswith("*"):
@@ -291,31 +326,52 @@ def random_test_appids(appids, n=5):
 
 def retry_call(func, *args, retries=MAX_RETRIES, delay=2, appid=None, label=""):
     for attempt in range(1, retries + 1):
+        if _should_stop():
+            raise StopRequested()
         try:
             return func(*args)
+        except StopRequested:
+            raise
         except KeyboardInterrupt:
             raise
         except Exception as e:
             log.warning(f"[!] {label} ошибка (попытка {attempt}/{retries}): {e}")
             if attempt < retries:
-                time.sleep(delay)
+                for _ in range(delay):
+                    if _should_stop():
+                        raise StopRequested()
+                    time.sleep(1)
             else:
                 if appid is not None:
                     skipped_appids.add(appid)
                     with open(SKIPPED_FILE, "w", encoding="utf-8") as f:
-                        json.dump(sorted(skipped_appids), f, ensure_ascii=False, indent=2)
+                        json.dump(sorted(skipped_appids), f,
+                                  ensure_ascii=False, indent=2)
                 raise
 
 
 # ================== СОСТОЯНИЕ ПАРСЕРА ==================
 
-def get_last_processed_appid(games_cur):
-    games_cur.execute("SELECT last_appid FROM parser_state WHERE id=1")
-    return games_cur.fetchone()[0]
+def get_parser_state(games_cur):
+    """Возвращает (last_appid, current_appid)."""
+    games_cur.execute(
+        "SELECT last_appid, current_appid FROM parser_state WHERE id=1")
+    row = games_cur.fetchone()
+    return (row[0] or 0), row[1]
+
+
+def set_current_appid(games_db, games_cur, appid):
+    """Записывает appid ДО начала обработки — checkpoint."""
+    games_cur.execute(
+        "UPDATE parser_state SET current_appid=? WHERE id=1", (appid,))
+    games_db.commit()
 
 
 def set_last_processed_appid(games_db, games_cur, appid):
-    games_cur.execute("UPDATE parser_state SET last_appid=? WHERE id=1", (appid,))
+    """Записывает appid ПОСЛЕ успешной обработки, сбрасывает current."""
+    games_cur.execute(
+        "UPDATE parser_state SET last_appid=?, current_appid=NULL WHERE id=1",
+        (appid,))
     games_db.commit()
 
 
@@ -324,7 +380,6 @@ def set_last_processed_appid(games_db, games_cur, appid):
 def process_app(appid, games_db, games_cur, nongames_db, nongames_cur):
     start = time.time()
 
-    # EN-запрос — основной, без него смысла нет
     app  = retry_call(get_appdetails, appid, appid=appid, label="Steam EN")
     data = app.get("data", {})
     item_type = data.get("type")
@@ -332,21 +387,20 @@ def process_app(appid, games_db, games_cur, nongames_db, nongames_cur):
     log.info(f"[{appid}] {name!r} type={item_type!r}")
 
     if not app.get("success"):
-        # AppID не существует или удалён
         nongames_cur.execute("INSERT OR REPLACE INTO items VALUES (?,?,?,?)",
                              (appid, name, item_type, None))
         nongames_db.commit()
         return
 
     if item_type != "game":
-        # DLC, soundtrack, demo, tool и т.д.
         nongames_cur.execute("INSERT OR REPLACE INTO items VALUES (?,?,?,?)",
-                             (appid, name, item_type, json.dumps(data, ensure_ascii=False)))
+                             (appid, name, item_type,
+                              json.dumps(data, ensure_ascii=False)))
         nongames_db.commit()
         return
 
-    # RU-запрос нужен только для игр (описание, дата)
-    app_ru  = retry_call(get_appdetails, appid, "ru", appid=appid, label="Steam RU")
+    app_ru  = retry_call(get_appdetails, appid, "ru",
+                         appid=appid, label="Steam RU")
     data_ru = app_ru.get("data", {})
 
     price = get_price_usd(data)
@@ -375,7 +429,8 @@ def process_app(appid, games_db, games_cur, nongames_db, nongames_cur):
         INSERT OR REPLACE INTO games
         (appid, name, price_usd, short_description, header_image,
          release_year, release_month, release_day,
-         total_reviews, positive_reviews, negative_reviews, review_percent, review_score,
+         total_reviews, positive_reviews, negative_reviews,
+         review_percent, review_score,
          hltb_main, hltb_extra, hltb_completion, hltb_id)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
@@ -389,42 +444,50 @@ def process_app(appid, games_db, games_cur, nongames_db, nongames_cur):
     ))
 
     for lang, has_audio in languages.items():
-        games_cur.execute("INSERT OR IGNORE INTO languages_dict (name) VALUES (?)", (lang,))
+        games_cur.execute(
+            "INSERT OR IGNORE INTO languages_dict (name) VALUES (?)", (lang,))
         games_cur.execute("""
             INSERT OR REPLACE INTO languages_games (appid, language_id, full_audio)
             VALUES (?, (SELECT id FROM languages_dict WHERE name=?), ?)
         """, (appid, lang, 1 if has_audio else 0))
 
-    for cat in {c["description"].strip() for c in data.get("categories", []) if c.get("description")}:
-        games_cur.execute("INSERT OR IGNORE INTO categories_dict (name) VALUES (?)", (cat,))
+    for cat in {c["description"].strip()
+                for c in data.get("categories", []) if c.get("description")}:
+        games_cur.execute(
+            "INSERT OR IGNORE INTO categories_dict (name) VALUES (?)", (cat,))
         games_cur.execute("""
             INSERT OR IGNORE INTO categories_games (appid, category_id)
             VALUES (?, (SELECT id FROM categories_dict WHERE name=?))
         """, (appid, cat))
 
-    for genre in {g["description"].strip() for g in data.get("genres", []) if g.get("description")}:
-        games_cur.execute("INSERT OR IGNORE INTO genres_dict (name) VALUES (?)", (genre,))
+    for genre in {g["description"].strip()
+                  for g in data.get("genres", []) if g.get("description")}:
+        games_cur.execute(
+            "INSERT OR IGNORE INTO genres_dict (name) VALUES (?)", (genre,))
         games_cur.execute("""
             INSERT OR IGNORE INTO genres_games (appid, genre_id)
             VALUES (?, (SELECT id FROM genres_dict WHERE name=?))
         """, (appid, genre))
 
     for tag in tags:
-        games_cur.execute("INSERT OR IGNORE INTO tags_dict (name) VALUES (?)", (tag,))
+        games_cur.execute(
+            "INSERT OR IGNORE INTO tags_dict (name) VALUES (?)", (tag,))
         games_cur.execute("""
             INSERT OR IGNORE INTO tags_games (appid, tag_id)
             VALUES (?, (SELECT id FROM tags_dict WHERE name=?))
         """, (appid, tag))
 
     for dev in data.get("developers", []):
-        games_cur.execute("INSERT OR IGNORE INTO developers_dict (name) VALUES (?)", (dev,))
+        games_cur.execute(
+            "INSERT OR IGNORE INTO developers_dict (name) VALUES (?)", (dev,))
         games_cur.execute("""
             INSERT OR IGNORE INTO developers_games (appid, developer_id)
             VALUES (?, (SELECT id FROM developers_dict WHERE name=?))
         """, (appid, dev))
 
     for pub in data.get("publishers", []):
-        games_cur.execute("INSERT OR IGNORE INTO publishers_dict (name) VALUES (?)", (pub,))
+        games_cur.execute(
+            "INSERT OR IGNORE INTO publishers_dict (name) VALUES (?)", (pub,))
         games_cur.execute("""
             INSERT OR IGNORE INTO publishers_games (appid, publisher_id)
             VALUES (?, (SELECT id FROM publishers_dict WHERE name=?))
@@ -440,14 +503,24 @@ def process_app(appid, games_db, games_cur, nongames_db, nongames_cur):
 
 # ================== ЗАПУСК ==================
 
-if __name__ == "__main__":
+def run():
+    """Вызывается из GUI в потоке или напрямую через __main__."""
     games_db, games_cur, nongames_db, nongames_cur = init_databases()
 
-    with open("steam_appids.json", "r", encoding="utf-8") as f:
+    appids_path = _app_path("steam_appids.json")
+    if not os.path.exists(appids_path):
+        log.error(f"Файл не найден: {appids_path}")
+        return
+
+    with open(appids_path, "r", encoding="utf-8") as f:
         appids = sorted(set(json.load(f)))
 
-    last_appid = get_last_processed_appid(games_cur)
-    if last_appid:
+    last_appid, current_appid = get_parser_state(games_cur)
+    if current_appid:
+        log.info(
+            f"Прошлый сеанс прерван на AppID={current_appid}, перезапускаем его")
+        appids = [a for a in appids if a >= current_appid]
+    elif last_appid:
         log.info(f"Продолжаем с appid > {last_appid}")
         appids = [a for a in appids if a > last_appid]
 
@@ -457,11 +530,20 @@ if __name__ == "__main__":
 
     try:
         for idx, appid in enumerate(appids, 1):
+            if _should_stop():
+                log.info("Остановлено пользователем")
+                break
+
             app_start = time.time()
-            log.info(f"\n=== {idx}/{total} AppID={appid} ({idx/total*100:.1f}%) ===")
+            log.info(
+                f"\n=== {idx}/{total} AppID={appid} ({idx/total*100:.1f}%) ===")
+            set_current_appid(games_db, games_cur, appid)
             try:
                 process_app(appid, games_db, games_cur, nongames_db, nongames_cur)
                 status = "Готово"
+            except StopRequested:
+                log.info("Остановлено пользователем")
+                break
             except Exception as e:
                 status = f"Ошибка: {e}"
 
@@ -480,3 +562,7 @@ if __name__ == "__main__":
         games_db.close()
         nongames_db.close()
         log.info("БД закрыты")
+
+
+if __name__ == "__main__":
+    run()

@@ -9,7 +9,6 @@ import queue
 import re
 import signal
 import sqlite3
-import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -44,7 +43,22 @@ FONT_TITLE = ("Segoe UI Semibold", 13)
 FONT_SMALL = ("Segoe UI", 8)
 FONT_CAP   = ("Consolas", 8)
 
-DB_PATH       = "games.db"
+def _base_dir() -> str:
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _app_path(f: str) -> str:
+    """Файлы данных — рядом с exe/скриптом (БД, json)."""
+    return os.path.join(_base_dir(), f)
+
+def _internal_path(f: str) -> str:
+    """Bundled-модули — внутри sys._MEIPASS или рядом со скриптом."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, f)
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f)
+
+DB_PATH = _app_path("games.db")
 PARSER_SCRIPT = "parse.py"
 MAX_LOG       = 600
 
@@ -147,9 +161,10 @@ class App(tk.Tk):
         self.minsize(960, 620)
         self.configure(bg=C_BG)
         # Кириллица: явно задаём кодировку для stdout при subprocess
-        self._proc    = None
-        self._logq    = queue.Queue()
-        self._running = False
+        self._proc       = None
+        self._logq       = queue.Queue()
+        self._running    = False
+        self._stop_event = threading.Event()
 
         self._styles()
         self._build()
@@ -491,37 +506,57 @@ class App(tk.Tk):
     def _start(self):
         if self._running:
             return
+        # Добавляем папку с модулями в sys.path (для exe: sys._MEIPASS)
+        internal = _internal_path("")
+        if internal not in sys.path:
+            sys.path.insert(0, internal)
         try:
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            proc = subprocess.Popen(
-                [sys.executable, "-u", PARSER_SCRIPT],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                bufsize=1, env=env,
-                cwd=os.path.dirname(os.path.abspath(__file__)))
-        except FileNotFoundError:
-            messagebox.showerror("Ошибка", f"{PARSER_SCRIPT} не найден рядом с gui.py")
+            import parse as parser_module
+        except ImportError as e:
+            messagebox.showerror("Ошибка", f"parse.py не найден: {e}")
             return
-        except Exception as e:
-            messagebox.showerror("Ошибка запуска", str(e))
-            return
-        self._proc    = proc
+        self._stop_event.clear()
         self._running = True
         self._set_live(True)
-        threading.Thread(target=self._reader, args=(proc,), daemon=True).start()
+        threading.Thread(
+            target=self._run_parser,
+            args=(parser_module,),
+            daemon=True
+        ).start()
 
     def _stop(self):
-        if self._proc:
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
+        self._stop_event.set()
 
-    def _reader(self, proc):
-        for line in iter(proc.stdout.readline, ""):
-            self._logq.put(line.rstrip())
-        self._logq.put(None)
+    def _run_parser(self, parser_module):
+        """Запускает парсер в потоке, перехватывает логи через logging."""
+        import logging
+
+        class QueueHandler(logging.Handler):
+            def __init__(self, q):
+                super().__init__()
+                self.q = q
+            def emit(self, record):
+                self.q.put(self.format(record))
+
+        handler = QueueHandler(self._logq)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s",
+            datefmt="%H:%M:%S"
+        ))
+
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+
+        try:
+            # Передаём stop_event в парсер — он проверяет его в retry_call и get_hltb
+            parser_module._GUI_STOP_EVENT = self._stop_event
+            parser_module.run()
+        except Exception as e:
+            self._logq.put(f"[ERROR] Парсер завершился с ошибкой: {e}")
+        finally:
+            parser_module._GUI_STOP_EVENT = None
+            root_logger.removeHandler(handler)
+            self._logq.put(None)
 
     # Regex для парсинга строки вида:
     # === Обработка 42/1000 AppID=730 (4.2%) ===
@@ -617,14 +652,13 @@ class App(tk.Tk):
         try:
             from hltb_check import check_hltb
             res = check_hltb()
-        except ImportError:
-            self.after(0, lambda: self._hltb_done(None, "hltb_check.py не найден"))
+        except ImportError as e:
+            self.after(0, lambda: self._hltb_done(None, f"hltb_check.py не найден: {e}"))
             return
         except Exception as e:
             self.after(0, lambda: self._hltb_done(None, str(e)))
             return
         self.after(0, lambda: self._hltb_done(res))
-
     def _hltb_done(self, res, import_err=None):
         self._btn_hltb.configure(state="normal", text="⟳  Проверить HLTB", fg=C_MUTED)
         if import_err:
